@@ -16,10 +16,11 @@ from matchers.similarity_matcher import SimilarityMatcher
 from utils.data_reader import DataReader
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO) 
 
 
 class LogoMatchingPipeline:
@@ -29,8 +30,10 @@ class LogoMatchingPipeline:
                  similarity_threshold: float = 0.15):
         self.output_dir = output_dir
         self.cache_dir = cache_dir
+        
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(cache_dir, exist_ok=True)
+        
         self.extractor = LogoExtractor()
         self.processor = ImageProcessor(cache_dir=cache_dir)
         self.feature_extractor = FeatureExtractor()
@@ -61,7 +64,7 @@ class LogoMatchingPipeline:
         logo_urls = {}
         failed = []
         
-        for website in tqdm(websites, desc="Extracting logos"):
+        for website in tqdm(websites, desc="Extracting logos", unit="site"):
             try:
                 logo_url = self.extractor.extract_logo(website)
                 if logo_url:
@@ -69,9 +72,9 @@ class LogoMatchingPipeline:
                 else:
                     failed.append(website)
                 
-                time.sleep(0.1)
+                time.sleep(0.01) 
             except Exception as e:
-                logger.error(f"Error extracting logo for {website}: {e}")
+                logger.debug(f"Error extracting logo for {website}: {e}")
                 failed.append(website)
         
         extraction_rate = len(logo_urls) / len(websites) * 100
@@ -89,7 +92,7 @@ class LogoMatchingPipeline:
         all_features = {}
         failed = []
         
-        for website, logo_url in tqdm(logo_urls.items(), desc="Processing logos"):
+        for website, logo_url in tqdm(logo_urls.items(), desc="Processing logos", unit="logo"):
             try:
                 result = self.processor.process_logo(logo_url)
                 if result is None:
@@ -105,7 +108,7 @@ class LogoMatchingPipeline:
                     failed.append(website)
                 
             except Exception as e:
-                logger.error(f"Error processing {website}: {e}")
+                logger.debug(f"Error processing {website}: {e}")
                 failed.append(website)
         
         logger.info(f"Feature extraction complete: {len(all_features)}/{len(logo_urls)} logos processed")
@@ -196,11 +199,19 @@ class LogoMatchingPipeline:
                     f.write(f"  ... and {len(group) - 5} more\n")
         
         logger.info(f"Summary saved to {summary_path}")
+        print("\n" + "=" * 80)
+        print("RESULTS SUMMARY")
+        print("=" * 80)
+        print(f"Extraction Rate: {extracted}/{total_input} ({extracted/total_input*100:.1f}%)")
+        print(f"Total Groups: {len(groups)}")
+        print(f"Largest Group: {len(groups[0])} websites" if groups else "No groups")
+        print(f"Unique Logos: {size_counts.get(1, 0)}")
+        print("=" * 80 + "\n")
     
     def run(self, website_list_file: str):
-        logger.info("=" * 80)
-        logger.info("STARTING LOGO MATCHING PIPELINE")
-        logger.info("=" * 80)
+        print("=" * 80)
+        print("LOGO MATCHING PIPELINE - OPTIMIZED VERSION")
+        print("=" * 80)
         
         start_time = time.time()
         
@@ -210,6 +221,7 @@ class LogoMatchingPipeline:
             return
         
         total_input = len(websites)
+        print(f"Processing {total_input} websites...\n")
         
         logo_urls = self.extract_logos(websites)
         if not logo_urls:
@@ -226,15 +238,14 @@ class LogoMatchingPipeline:
         self.save_results(groups, all_features, logo_urls, total_input)
         
         elapsed = time.time() - start_time
-        logger.info("=" * 80)
-        logger.info(f"PIPELINE COMPLETE in {elapsed:.1f} seconds")
-        logger.info("=" * 80)
+        print(f"Pipeline completed in {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
+        print(f"Results saved to {self.output_dir}/")
 
 
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Logo Similarity Matcher')
+    parser = argparse.ArgumentParser(description='Logo Similarity Matcher - Optimized')
     parser.add_argument('--input', '-i', required=True, 
                        help='Input file (.parquet, .csv, or .txt)')
     parser.add_argument('--output', '-o', default='output', help='Output directory')
