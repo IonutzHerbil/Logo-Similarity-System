@@ -1,8 +1,4 @@
-﻿"""
-similarity matcher. hand-rolled because using real ML felt like cheating.
-"""
-
-import numpy as np
+﻿import numpy as np
 from scipy.spatial.distance import cosine, euclidean
 import imagehash
 import logging
@@ -14,23 +10,18 @@ logger = logging.getLogger(__name__)
 
 
 class SimilarityMatcher:
-    """
-    Match and group logos using simple math. nothing too smart happening here.
-    """
     
     def __init__(self, 
                  color_weight: float = 0.3,
                  hog_weight: float = 0.3,
                  hash_weight: float = 0.4,
                  similarity_threshold: float = 0.15):
-        # i just guessed these weights until things looked ok
         self.color_weight = color_weight
         self.hog_weight = hog_weight
         self.hash_weight = hash_weight
         self.similarity_threshold = similarity_threshold
     
     def compute_similarity(self, features_a: Dict, features_b: Dict) -> float:
-        """Compute combined similarity score between two feature sets"""
         try:
             distances = []
             weights = []
@@ -55,14 +46,12 @@ class SimilarityMatcher:
                 combined_distance = sum(d * w for d, w in zip(distances, weights)) / total_weight
                 return combined_distance
             else:
-                # no features? then they are basically unrelated
                 return 1.0
         except Exception as e:
             logger.debug(f"Similarity computation failed: {e}")
             return 1.0
     
     def _cosine_distance(self, vec_a: np.ndarray, vec_b: np.ndarray) -> float:
-        """Compute cosine distance"""
         try:
             if np.linalg.norm(vec_a) == 0 or np.linalg.norm(vec_b) == 0:
                 return 1.0
@@ -71,7 +60,6 @@ class SimilarityMatcher:
             return 1.0
     
     def _hash_distance(self, hash_a: str, hash_b: str) -> float:
-        """Compute normalized Hamming distance between hashes"""
         try:
             h1 = imagehash.hex_to_hash(hash_a)
             h2 = imagehash.hex_to_hash(hash_b)
@@ -86,7 +74,6 @@ class SimilarityMatcher:
             return 1.0
     
     def create_similarity_matrix(self, all_features: List[Dict]) -> np.ndarray:
-        """Create pairwise similarity matrix for all logos"""
         n = len(all_features)
         matrix = np.zeros((n, n))
         
@@ -103,7 +90,6 @@ class SimilarityMatcher:
     def threshold_based_clustering(self, 
                                    similarity_matrix: np.ndarray,
                                    website_urls: List[str]) -> List[List[str]]:
-        """Custom threshold-based clustering algorithm (NO ML libraries)"""
         n = len(website_urls)
         
         groups = {i: {i} for i in range(n)}
@@ -142,7 +128,6 @@ class SimilarityMatcher:
         return result
     
     def _find_group(self, index: int, groups: Dict[int, Set[int]]) -> int:
-        """Find which group an index belongs to"""
         for group_id, members in groups.items():
             if index in members:
                 return group_id
@@ -151,7 +136,6 @@ class SimilarityMatcher:
     def compute_group_statistics(self, 
                                  groups: List[List[str]], 
                                  all_features: Dict[str, Dict]) -> List[Dict]:
-        """Compute statistics for each group"""
         group_stats = []
         
         for i, group in enumerate(groups):
