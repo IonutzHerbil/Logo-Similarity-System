@@ -6,6 +6,7 @@ from typing import List, Dict
 import logging
 from tqdm import tqdm
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -15,70 +16,84 @@ from processors.feature_extractor import FeatureExtractor
 from matchers.similarity_matcher import SimilarityMatcher
 from utils.data_reader import DataReader
 
-logging.basicConfig(
-    level=logging.WARNING,  
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO) 
+logger.setLevel(logging.INFO)
 
 
-class LogoMatchingPipeline:
-    def __init__(self, 
-                 output_dir: str = 'output',
-                 cache_dir: str = 'logo_cache',
-                 similarity_threshold: float = 0.15):
+class LogoPipeline:
+    def __init__(self, output_dir='output', cache_dir='logo_cache', 
+                 max_extract_workers=20, max_process_workers=10,
+                 eps=0.12, min_samples=2, use_selenium=True):
+        
         self.output_dir = output_dir
         self.cache_dir = cache_dir
         
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(cache_dir, exist_ok=True)
         
-        self.extractor = LogoExtractor()
+        self.extractor = LogoExtractor(cache_dir=cache_dir, use_selenium=use_selenium)
         self.processor = ImageProcessor(cache_dir=cache_dir)
         self.feature_extractor = FeatureExtractor()
-        self.matcher = SimilarityMatcher(similarity_threshold=similarity_threshold)
+        self.matcher = SimilarityMatcher(eps=eps, min_samples=min_samples)
         
-        logger.info("Pipeline initialized")
+        self.max_extract_workers = max_extract_workers
+        self.max_process_workers = max_process_workers
+        
+        logger.info(f"Pipeline initialized: extract_workers={max_extract_workers}, process_workers={max_process_workers}, eps={eps}")
     
-    def load_website_list(self, filepath: str) -> List[str]:
+    def load_websites(self, filepath):
         try:
-            file_ext = Path(filepath).suffix.lower()
+            ext = Path(filepath).suffix.lower()
             
-            if file_ext == '.parquet':
+            if ext == '.parquet':
                 websites = DataReader.read_parquet(filepath)
-            elif file_ext == '.csv':
+            elif ext == '.csv':
                 websites = DataReader.read_csv(filepath)
             else:
                 websites = DataReader.read_text_file(filepath)
             
-            logger.info(f"Loaded {len(websites)} websites from {filepath}")
+            logger.info(f"Loaded {len(websites)} websites")
             return websites
         except Exception as e:
-            logger.error(f"Failed to load website list: {e}")
+            logger.error(f"Failed to load websites: {e}")
             return []
     
-    def extract_logos(self, websites: List[str]) -> Dict[str, str]:
-        logger.info(f"Starting logo extraction for {len(websites)} websites...")
+    def extract_logos(self, websites):
+        logger.info(f"Extracting logos from {len(websites)} websites...")
+        print(f"\n{'='*80}\nPHASE 1: LOGO EXTRACTION\n{'='*80}\n")
         
         logo_urls = {}
         failed = []
         
-        for website in tqdm(websites, desc="Extracting logos", unit="site"):
-            try:
-                logo_url = self.extractor.extract_logo(website)
-                if logo_url:
-                    logo_urls[website] = logo_url
-                else:
+        with ThreadPoolExecutor(max_workers=self.max_extract_workers) as executor:
+            future_to_website = {
+                executor.submit(self.extractor.extract_logo, w): w for w in websites
+            }
+            
+            for future in tqdm(as_completed(future_to_website), total=len(websites), 
+                             desc="Extracting", unit="site"):
+                website = future_to_website[future]
+                try:
+                    logo_url = future.result(timeout=30)
+                    if logo_url:
+                        logo_urls[website] = logo_url
+                    else:
+                        failed.append(website)
+                except:
                     failed.append(website)
-                
-                time.sleep(0.01) 
-            except Exception as e:
-                logger.debug(f"Error extracting logo for {website}: {e}")
-                failed.append(website)
         
-        extraction_rate = len(logo_urls) / len(websites) * 100
-        logger.info(f"Logo extraction complete: {len(logo_urls)}/{len(websites)} ({extraction_rate:.1f}%)")
+        rate = len(logo_urls) / len(websites) * 100
+        print(f"\n{'='*80}")
+        print(f"EXTRACTION: {len(logo_urls)}/{len(websites)} ({rate:.1f}%)")
+        print(f"{'='*80}\n")
+        
+        stats = self.extractor.get_statistics()
+        if stats:
+            print("Methods:")
+            for method, data in stats.items():
+                print(f"  {method}: {data['count']} ({data['percentage']:.1f}%)")
+            print()
         
         if failed:
             with open(os.path.join(self.output_dir, 'failed_extractions.txt'), 'w') as f:
@@ -86,32 +101,47 @@ class LogoMatchingPipeline:
         
         return logo_urls
     
-    def process_and_extract_features(self, logo_urls: Dict[str, str]) -> Dict[str, Dict]:
-        logger.info(f"Processing and extracting features for {len(logo_urls)} logos...")
+    def process_logos(self, logo_urls):
+        logger.info(f"Processing {len(logo_urls)} logos...")
+        print(f"\n{'='*80}\nPHASE 2: FEATURE EXTRACTION\n{'='*80}\n")
         
         all_features = {}
         failed = []
         
-        for website, logo_url in tqdm(logo_urls.items(), desc="Processing logos", unit="logo"):
+        def process_single(item):
+            website, logo_url = item
             try:
                 result = self.processor.process_logo(logo_url)
                 if result is None:
-                    failed.append(website)
-                    continue
+                    return website, None
                 
-                processed_img, pil_img = result
+                img, pil_img = result
+                features = self.feature_extractor.extract_features(img, pil_img)
                 
-                features = self.feature_extractor.extract_features(processed_img, pil_img)
-                if features:
-                    all_features[website] = features
-                else:
-                    failed.append(website)
-                
-            except Exception as e:
-                logger.debug(f"Error processing {website}: {e}")
-                failed.append(website)
+                return website, features
+            except:
+                return website, None
         
-        logger.info(f"Feature extraction complete: {len(all_features)}/{len(logo_urls)} logos processed")
+        with ThreadPoolExecutor(max_workers=self.max_process_workers) as executor:
+            future_to_item = {
+                executor.submit(process_single, item): item for item in logo_urls.items()
+            }
+            
+            for future in tqdm(as_completed(future_to_item), total=len(logo_urls),
+                             desc="Processing", unit="logo"):
+                try:
+                    website, features = future.result(timeout=60)
+                    if features:
+                        all_features[website] = features
+                    else:
+                        failed.append(website)
+                except:
+                    failed.append("unknown")
+        
+        rate = len(all_features) / len(logo_urls) * 100
+        print(f"\n{'='*80}")
+        print(f"PROCESSING: {len(all_features)}/{len(logo_urls)} ({rate:.1f}%)")
+        print(f"{'='*80}\n")
         
         if failed:
             with open(os.path.join(self.output_dir, 'failed_processing.txt'), 'w') as f:
@@ -119,144 +149,160 @@ class LogoMatchingPipeline:
         
         return all_features
     
-    def compute_groups(self, all_features: Dict[str, Dict]) -> List[List[str]]:
-        logger.info("Computing similarity matrix...")
+    def compute_groups(self, all_features):
+        logger.info("Computing similarity and clustering...")
+        print(f"\n{'='*80}\nPHASE 3: CLUSTERING\n{'='*80}\n")
         
-        website_urls = list(all_features.keys())
-        features_list = [all_features[url] for url in website_urls]
+        urls = list(all_features.keys())
+        features = [all_features[url] for url in urls]
         
-        similarity_matrix = self.matcher.create_similarity_matrix(features_list)
+        sim_matrix = self.matcher.create_similarity_matrix(features)
+        groups = self.matcher.cluster_logos(sim_matrix, urls)
         
-        logger.info("Performing threshold-based clustering...")
-        groups = self.matcher.threshold_based_clustering(similarity_matrix, website_urls)
-        
-        logger.info(f"Clustering complete: {len(groups)} groups formed")
+        print(f"\n{'='*80}")
+        print(f"CLUSTERING: {len(groups)} groups")
+        print(f"Largest: {len(groups[0]) if groups else 0} websites")
+        print(f"Singletons: {sum(1 for g in groups if len(g) == 1)}")
+        print(f"{'='*80}\n")
         
         return groups
     
-    def save_results(self, 
-                    groups: List[List[str]], 
-                    all_features: Dict[str, Dict],
-                    logo_urls: Dict[str, str],
-                    total_input_websites: int):
+    def save_results(self, groups, all_features, logo_urls, total_input):
+        stats = self.matcher.compute_group_statistics(groups, all_features)
         
-        group_stats = self.matcher.compute_group_statistics(groups, all_features)
-        
-        for stats in group_stats:
-            for i, website in enumerate(stats['websites']):
-                stats['websites'][i] = {
+        for s in stats:
+            for i, website in enumerate(s['websites']):
+                s['websites'][i] = {
                     'url': website,
                     'logo_url': logo_urls.get(website, '')
                 }
         
-        extraction_rate = (len(logo_urls) / total_input_websites * 100) if total_input_websites > 0 else 0
+        ext_rate = (len(logo_urls) / total_input * 100) if total_input > 0 else 0
         
-        output_path = os.path.join(self.output_dir, 'logo_groups.json')
-        with open(output_path, 'w') as f:
+        output = os.path.join(self.output_dir, 'logo_groups.json')
+        with open(output, 'w') as f:
             json.dump({
-                'total_input_websites': total_input_websites,
-                'successfully_extracted': len(logo_urls),
-                'extraction_rate_percent': round(extraction_rate, 2),
-                'total_groups': len(groups),
-                'groups': group_stats
+                'metadata': {
+                    'total_input': total_input,
+                    'extracted': len(logo_urls),
+                    'extraction_rate': round(ext_rate, 2),
+                    'processed': len(all_features),
+                    'groups': len(groups),
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                },
+                'groups': stats
             }, f, indent=2)
         
-        logger.info(f"Results saved to {output_path}")
+        logger.info(f"Results saved to {output}")
         
-        self._save_summary(groups, total_input_websites, len(logo_urls), all_features)
+        self._save_summary(groups, total_input, len(logo_urls), all_features)
+        self._save_distribution(groups)
     
-    def _save_summary(self, groups: List[List[str]], total_input: int, extracted: int, all_features: Dict):
-        summary_path = os.path.join(self.output_dir, 'summary.txt')
+    def _save_summary(self, groups, total, extracted, features):
+        path = os.path.join(self.output_dir, 'summary.txt')
         
-        with open(summary_path, 'w') as f:
+        size_counts = {}
+        for g in groups:
+            size = len(g)
+            size_counts[size] = size_counts.get(size, 0) + 1
+        
+        with open(path, 'w') as f:
             f.write("=" * 80 + "\n")
-            f.write("LOGO MATCHING RESULTS SUMMARY\n")
+            f.write("LOGO MATCHING RESULTS\n")
             f.write("=" * 80 + "\n\n")
-            
-            f.write(f"Total input websites: {total_input}\n")
-            f.write(f"Successfully extracted logos: {extracted}\n")
-            f.write(f"Extraction rate: {extracted/total_input*100:.2f}%\n")
-            f.write(f"Total groups formed: {len(groups)}\n\n")
-            
-            f.write("Group Size Distribution:\n")
+            f.write(f"Input: {total}\n")
+            f.write(f"Extracted: {extracted} ({extracted/total*100:.1f}%)\n")
+            f.write(f"Processed: {len(features)}\n")
+            f.write(f"Groups: {len(groups)}\n\n")
+            f.write("Distribution:\n")
             f.write("-" * 40 + "\n")
-            size_counts = {}
-            for group in groups:
-                size = len(group)
-                size_counts[size] = size_counts.get(size, 0) + 1
-            
             for size in sorted(size_counts.keys(), reverse=True):
-                f.write(f"  Groups with {size} website(s): {size_counts[size]}\n")
-            
-            f.write("\n")
-            f.write("Top 10 Largest Groups:\n")
+                f.write(f"  {size} websites: {size_counts[size]} groups\n")
+            f.write("\nTop 20 Groups:\n")
             f.write("-" * 40 + "\n")
-            for i, group in enumerate(groups[:10], 1):
-                f.write(f"\nGroup {i} ({len(group)} websites):\n")
-                for website in group[:5]:
-                    f.write(f"  - {website}\n")
-                if len(group) > 5:
-                    f.write(f"  ... and {len(group) - 5} more\n")
+            for i, g in enumerate(groups[:20], 1):
+                f.write(f"\nGroup {i} ({len(g)} websites):\n")
+                for w in g[:10]:
+                    f.write(f"  - {w}\n")
+                if len(g) > 10:
+                    f.write(f"  ... +{len(g)-10} more\n")
         
-        logger.info(f"Summary saved to {summary_path}")
         print("\n" + "=" * 80)
-        print("RESULTS SUMMARY")
+        print("SUMMARY")
         print("=" * 80)
-        print(f"Extraction Rate: {extracted}/{total_input} ({extracted/total_input*100:.1f}%)")
-        print(f"Total Groups: {len(groups)}")
-        print(f"Largest Group: {len(groups[0])} websites" if groups else "No groups")
-        print(f"Unique Logos: {size_counts.get(1, 0)}")
+        print(f"Extracted: {extracted}/{total} ({extracted/total*100:.1f}%)")
+        print(f"Processed: {len(features)}/{extracted} ({len(features)/extracted*100:.1f}%)")
+        print(f"Groups: {len(groups)}")
+        print(f"Largest: {len(groups[0])} websites" if groups else "0")
+        print(f"Unique: {size_counts.get(1, 0)}")
         print("=" * 80 + "\n")
     
-    def run(self, website_list_file: str):
-        print("=" * 80)
-        print("LOGO MATCHING PIPELINE - OPTIMIZED VERSION")
-        print("=" * 80)
+    def _save_distribution(self, groups):
+        path = os.path.join(self.output_dir, 'distribution.json')
         
-        start_time = time.time()
+        counts = {}
+        for g in groups:
+            size = len(g)
+            counts[size] = counts.get(size, 0) + 1
         
-        websites = self.load_website_list(website_list_file)
+        with open(path, 'w') as f:
+            json.dump({
+                'total_groups': len(groups),
+                'distribution': {str(k): v for k, v in sorted(counts.items(), reverse=True)}
+            }, f, indent=2)
+    
+    def run(self, input_file):
+        print("=" * 80)
+        print("LOGO SIMILARITY MATCHER")
+        print("=" * 80 + "\n")
+        
+        start = time.time()
+        
+        websites = self.load_websites(input_file)
         if not websites:
-            logger.error("No websites to process!")
             return
         
-        total_input = len(websites)
-        print(f"Processing {total_input} websites...\n")
+        total = len(websites)
         
         logo_urls = self.extract_logos(websites)
         if not logo_urls:
-            logger.error("No logos extracted!")
             return
         
-        all_features = self.process_and_extract_features(logo_urls)
-        if not all_features:
-            logger.error("No features extracted!")
+        features = self.process_logos(logo_urls)
+        if not features:
             return
         
-        groups = self.compute_groups(all_features)
+        groups = self.compute_groups(features)
+        self.save_results(groups, features, logo_urls, total)
         
-        self.save_results(groups, all_features, logo_urls, total_input)
+        self.extractor.cleanup()
         
-        elapsed = time.time() - start_time
-        print(f"Pipeline completed in {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
-        print(f"Results saved to {self.output_dir}/")
+        elapsed = time.time() - start
+        print(f"\nCompleted in {elapsed:.1f}s ({elapsed/60:.1f}min)")
+        print(f"Results: {self.output_dir}/\n")
 
 
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Logo Similarity Matcher - Optimized')
-    parser.add_argument('--input', '-i', required=True, 
-                       help='Input file (.parquet, .csv, or .txt)')
+    parser = argparse.ArgumentParser(description='Logo Similarity Matcher')
+    parser.add_argument('--input', '-i', required=True, help='Input file')
     parser.add_argument('--output', '-o', default='output', help='Output directory')
-    parser.add_argument('--threshold', '-t', type=float, default=0.15,
-                       help='Similarity threshold (0-1, lower = stricter)')
+    parser.add_argument('--eps', type=float, default=0.12, help='DBSCAN epsilon (lower=stricter)')
+    parser.add_argument('--min-samples', type=int, default=2, help='DBSCAN min samples')
+    parser.add_argument('--extract-workers', type=int, default=20, help='Extraction workers')
+    parser.add_argument('--process-workers', type=int, default=10, help='Processing workers')
+    parser.add_argument('--no-selenium', action='store_true', help='Disable Selenium')
     
     args = parser.parse_args()
     
-    pipeline = LogoMatchingPipeline(
+    pipeline = LogoPipeline(
         output_dir=args.output,
-        similarity_threshold=args.threshold
+        max_extract_workers=args.extract_workers,
+        max_process_workers=args.process_workers,
+        eps=args.eps,
+        min_samples=args.min_samples,
+        use_selenium=not args.no_selenium
     )
     
     pipeline.run(args.input)

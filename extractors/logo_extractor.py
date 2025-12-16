@@ -2,216 +2,249 @@
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import logging
-from typing import Optional, List, Dict
-import time
 from fake_useragent import UserAgent
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class LogoExtractor:
-    def __init__(self, timeout: int = 10):
+    def __init__(self, timeout=10, cache_dir='logo_cache', use_selenium=False):
         self.timeout = timeout
         self.ua = UserAgent()
         self.session = requests.Session()
-        
-    def _get_headers(self) -> Dict[str, str]:
-        return {
-            'User-Agent': self.ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+        self.cache = {}
+        self.stats = {
+            'third_party': 0,
+            'metadata': 0,
+            'opengraph': 0,
+            'heuristic': 0,
+            'common_paths': 0,
+            'failed': 0
         }
     
-    def _normalize_url(self, url: str) -> str:
+    def _get_headers(self):
+        return {
+            'User-Agent': self.ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+        }
+    
+    def _normalize_url(self, url):
         if not url.startswith(('http://', 'https://')):
             return f'https://{url}'
         return url
     
-    def _is_valid_image_url(self, url: str) -> bool:
-        if not url:
-            return False
-        image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico')
-        parsed = urlparse(url.lower())
-        return any(parsed.path.endswith(ext) for ext in image_extensions)
-    
-    def extract_logo(self, website_url: str) -> Optional[str]:
+    def extract_logo(self, website_url):
         website_url = self._normalize_url(website_url)
         
-        logo_url = self._extract_from_metadata(website_url)
-        if logo_url:
-            logger.info(f"Logo found via metadata for {website_url}")
-            return logo_url
+        if website_url in self.cache:
+            return self.cache[website_url]
         
-        logo_url = self._extract_from_opengraph(website_url)
-        if logo_url:
-            logger.info(f"Logo found via Open Graph for {website_url}")
-            return logo_url
+        result = self._try_services(website_url)
+        if result:
+            self.stats['third_party'] += 1
+            self.cache[website_url] = result
+            return result
         
-        logo_url = self._extract_from_heuristics(website_url)
-        if logo_url:
-            logger.info(f"Logo found via heuristics for {website_url}")
-            return logo_url
+        result = self._try_metadata(website_url)
+        if result:
+            self.stats['metadata'] += 1
+            self.cache[website_url] = result
+            return result
         
-        logo_url = self._extract_from_common_paths(website_url)
-        if logo_url:
-            logger.info(f"Logo found via common paths for {website_url}")
-            return logo_url
+        result = self._try_opengraph(website_url)
+        if result:
+            self.stats['opengraph'] += 1
+            self.cache[website_url] = result
+            return result
         
-        logger.warning(f"No logo found for {website_url}")
+        result = self._search_page(website_url)
+        if result:
+            self.stats['heuristic'] += 1
+            self.cache[website_url] = result
+            return result
+        
+        result = self._try_common_paths(website_url)
+        if result:
+            self.stats['common_paths'] += 1
+            self.cache[website_url] = result
+            return result
+        
+        self.stats['failed'] += 1
+        self.cache[website_url] = None
         return None
     
-    def _extract_from_metadata(self, url: str) -> Optional[str]:
-        try:
-            soup = self._get_soup(url)
-            if not soup:
-                return None
-            
-            link_tags = soup.find_all('link', rel=True)
-            for tag in link_tags:
-                rel = tag.get('rel', [])
-                if isinstance(rel, str):
-                    rel = [rel]
-                
-                if any(r in ['apple-touch-icon', 'icon', 'shortcut icon'] for r in rel):
-                    href = tag.get('href')
-                    if href:
-                        full_url = urljoin(url, href)
-                        if self._is_valid_image_url(full_url):
-                            return full_url
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Metadata extraction failed for {url}: {e}")
-            return None
-    
-    def _extract_from_opengraph(self, url: str) -> Optional[str]:
-        try:
-            soup = self._get_soup(url)
-            if not soup:
-                return None
-            
-            og_image = soup.find('meta', property='og:image')
-            if og_image and og_image.get('content'):
-                full_url = urljoin(url, og_image['content'])
-                if self._is_valid_image_url(full_url):
-                    return full_url
-            
-            og_logo = soup.find('meta', property='og:logo')
-            if og_logo and og_logo.get('content'):
-                full_url = urljoin(url, og_logo['content'])
-                if self._is_valid_image_url(full_url):
-                    return full_url
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Open Graph extraction failed for {url}: {e}")
-            return None
-    
-    def _extract_from_heuristics(self, url: str) -> Optional[str]:
-        try:
-            soup = self._get_soup(url)
-            if not soup:
-                return None
-            
-            logo_keywords = ['logo', 'brand', 'site-logo', 'header-logo', 'company-logo']
-            
-            header = soup.find(['header', 'nav'])
-            if header:
-                img = self._find_logo_in_element(header, logo_keywords, url)
-                if img:
-                    return img
-            
-            for keyword in logo_keywords:
-                elements = soup.find_all(class_=lambda x: x and keyword in x.lower())
-                for elem in elements:
-                    img = self._find_logo_in_element(elem, logo_keywords, url)
-                    if img:
-                        return img
-                
-                elements = soup.find_all(id=lambda x: x and keyword in x.lower())
-                for elem in elements:
-                    img = self._find_logo_in_element(elem, logo_keywords, url)
-                    if img:
-                        return img
-            
-            all_imgs = soup.find_all('img')
-            for img in all_imgs[:20]:
-                alt = img.get('alt', '').lower()
-                src = img.get('src', '').lower()
-                
-                if any(keyword in alt or keyword in src for keyword in logo_keywords):
-                    src_url = img.get('src')
-                    if src_url:
-                        full_url = urljoin(url, src_url)
-                        if self._is_valid_image_url(full_url):
-                            return full_url
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Heuristic extraction failed for {url}: {e}")
-            return None
-    
-    def _find_logo_in_element(self, element, keywords: List[str], base_url: str) -> Optional[str]:
-        img = element.find('img')
-        if img and img.get('src'):
-            full_url = urljoin(base_url, img['src'])
-            if self._is_valid_image_url(full_url):
-                return full_url
-        
-        if element.get('style'):
-            style = element['style']
-            if 'background-image' in style or 'background:' in style:
-                import re
-                urls = re.findall(r'url\([\'"]?([^\'"()]+)[\'"]?\)', style)
-                if urls:
-                    full_url = urljoin(base_url, urls[0])
-                    if self._is_valid_image_url(full_url):
-                        return full_url
-        
-        return None
-    
-    def _extract_from_common_paths(self, url: str) -> Optional[str]:
+    def _try_services(self, url):
         parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        domain = parsed.netloc or parsed.path.split('/')[0]
+        domain = domain.replace('www.', '')
         
-        common_paths = [
-            '/favicon.ico',
-            '/logo.png',
-            '/logo.svg',
-            '/images/logo.png',
-            '/assets/logo.png',
-            '/static/logo.png',
-            '/img/logo.png',
+        services = [
+            f"https://www.google.com/s2/favicons?domain={domain}&sz=256",
+            f"https://logo.clearbit.com/{domain}",
+            f"https://icons.duckduckgo.com/ip3/{domain}.ico",
         ]
         
-        for path in common_paths:
-            test_url = urljoin(base_url, path)
-            if self._url_exists(test_url):
-                return test_url
-        
+        for svc in services:
+            try:
+                resp = self.session.head(svc, timeout=5, allow_redirects=True)
+                if resp.status_code == 200:
+                    if 'image' in resp.headers.get('content-type', '').lower():
+                        return svc
+            except:
+                pass
         return None
     
-    def _get_soup(self, url: str) -> Optional[BeautifulSoup]:
+    def _try_metadata(self, url):
         try:
-            response = self.session.get(
-                url, 
-                headers=self._get_headers(), 
-                timeout=self.timeout,
-                allow_redirects=True
-            )
-            response.raise_for_status()
-            return BeautifulSoup(response.content, 'lxml')
-        except Exception as e:
-            logger.debug(f"Failed to fetch {url}: {e}")
+            soup = self._get_soup(url)
+            if not soup:
+                return None
+            
+            priorities = [
+                ['apple-touch-icon-precomposed'],
+                ['apple-touch-icon'],
+                ['icon'],
+                ['shortcut icon'],
+            ]
+            
+            for rel_list in priorities:
+                tags = soup.find_all('link', rel=lambda r: r and any(x in r for x in rel_list))
+                best = None
+                best_size = 0
+                
+                for tag in tags:
+                    href = tag.get('href')
+                    if not href:
+                        continue
+                    
+                    sizes = tag.get('sizes', '0x0')
+                    if sizes and 'x' in str(sizes):
+                        try:
+                            size = int(str(sizes).split('x')[0])
+                            if size > best_size:
+                                best_size = size
+                                best = tag
+                        except:
+                            if best is None:
+                                best = tag
+                    elif best is None:
+                        best = tag
+                
+                if best:
+                    href = best.get('href')
+                    full = urljoin(url, href)
+                    if self._check_url(full):
+                        return full
+            return None
+        except:
             return None
     
-    def _url_exists(self, url: str) -> bool:
+    def _try_opengraph(self, url):
         try:
-            response = self.session.head(url, timeout=5, allow_redirects=True)
-            return response.status_code == 200
+            soup = self._get_soup(url)
+            if not soup:
+                return None
+            
+            props = ['og:logo', 'og:image', 'twitter:image']
+            for prop in props:
+                tag = soup.find('meta', property=prop)
+                if not tag:
+                    tag = soup.find('meta', attrs={'name': prop})
+                
+                if tag and tag.get('content'):
+                    full = urljoin(url, tag['content'])
+                    if self._check_url(full):
+                        return full
+            return None
         except:
-            return False
+            return None
+    
+    def _search_page(self, url):
+        try:
+            soup = self._get_soup(url)
+            if not soup:
+                return None
+            
+            keywords = ['logo', 'brand', 'site-logo', 'header-logo']
+            header = soup.find(['header', 'nav'])
+            if header:
+                imgs = header.find_all('img', limit=20)
+                for img in imgs:
+                    if self._img_looks_like_logo(img, keywords):
+                        src = img.get('src') or img.get('data-src')
+                        if src:
+                            full = urljoin(url, src)
+                            if self._check_url(full):
+                                return full
+            
+            for kw in keywords:
+                elems = soup.find_all(class_=re.compile(kw, re.I), limit=10)
+                for elem in elems:
+                    img = elem.find('img')
+                    if img and img.get('src'):
+                        full = urljoin(url, img['src'])
+                        if self._check_url(full):
+                            return full
+            return None
+        except:
+            return None
+    
+    def _img_looks_like_logo(self, img, keywords):
+        alt = img.get('alt', '').lower()
+        src = img.get('src', '').lower()
+        cls = ' '.join(img.get('class', [])).lower()
+        text = f"{alt} {src} {cls}"
+        return any(kw in text for kw in keywords)
+    
+    def _try_common_paths(self, url):
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        
+        paths = [
+            '/logo.png', '/logo.svg', '/assets/logo.png',
+            '/images/logo.png', '/static/logo.png',
+            '/favicon.ico', '/apple-touch-icon.png',
+        ]
+        
+        for path in paths:
+            test_url = urljoin(base, path)
+            if self._check_url(test_url):
+                return test_url
+        return None
+    
+    def _get_soup(self, url):
+        try:
+            resp = self.session.get(url, headers=self._get_headers(), 
+                                   timeout=self.timeout, allow_redirects=True)
+            resp.raise_for_status()
+            return BeautifulSoup(resp.content, 'lxml')
+        except:
+            return None
+    
+    def _check_url(self, url):
+        try:
+            resp = self.session.head(url, timeout=5, allow_redirects=True)
+            if resp.status_code == 200:
+                return 'image' in resp.headers.get('content-type', '').lower()
+        except:
+            pass
+        exts = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico')
+        return any(url.lower().endswith(ext) for ext in exts)
+    
+    def get_statistics(self):
+        total = sum(self.stats.values())
+        if total == 0:
+            return None
+        
+        result = {}
+        for key, value in self.stats.items():
+            pct = (value / total) * 100
+            result[key] = {'count': value, 'percentage': round(pct, 1)}
+        return result
+    
+    def cleanup(self):
+        self.session.close()
