@@ -2,7 +2,6 @@
 from pathlib import Path
 from imagededup.methods import CNN
 from PIL import Image
-from PIL import Image
 from tqdm import tqdm
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -20,9 +19,7 @@ class SimilarityMatcher:
     def find_duplicates(self, encodings: Dict[str, np.ndarray]) -> Dict[str, List[Tuple[str, float]]]:
         return self.cnn.find_duplicates(
             encoding_map=encodings,
-            encoding_map=encodings,
             min_similarity_threshold=self.threshold,
-            scores=True
             scores=True
         )
 

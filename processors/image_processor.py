@@ -8,7 +8,7 @@ from typing import Optional
 class ImageProcessor:
     def __init__(self, image_dir: Path):
         self.image_dir = image_dir
-        self.image_dir.mkdir(exist_ok=True)
+        self.image_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
         self.ua = UserAgent()
 
@@ -20,11 +20,11 @@ class ImageProcessor:
             
             if min(img.size) < 64:
                 return None
+            
             if img.mode == "RGBA":
                 bg = Image.new("RGB", img.size, (255, 255, 255))
                 bg.paste(img, mask=img.split()[-1])
                 img = bg
-            elif img.mode != "RGB":
             elif img.mode != "RGB":
                 img = img.convert("RGB")
 
@@ -36,5 +36,5 @@ class ImageProcessor:
         except:
             return None
 
-    def cleanup(self):
+    def close(self):
         self.session.close()

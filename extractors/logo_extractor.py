@@ -26,12 +26,9 @@ class LogoExtractor:
             return None
 
         clearbit = f"https://logo.clearbit.com/{domain}"
-        try:
-            r = self.session.head(clearbit, timeout=5, allow_redirects=True)
-            if r.status_code == 200:
-                return clearbit
-        except:
-            pass
+        if self._is_image(clearbit):
+            return clearbit
+
         try:
             r = self.session.get(
                 website,
@@ -116,5 +113,5 @@ class LogoExtractor:
         except Exception:
             return False
 
-    def cleanup(self):
+    def close(self):
         self.session.close()

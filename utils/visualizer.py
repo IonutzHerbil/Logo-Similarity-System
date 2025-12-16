@@ -1,5 +1,4 @@
 from pathlib import Path
-import json
 
 class Visualizer:
     def __init__(self, output_dir: Path):
@@ -33,6 +32,7 @@ class Visualizer:
             html.append(f"<div class='group'>")
             html.append(f"<div class='group-header'><span>{group[0]['group_id'].upper()}</span> <span>Size: {group[0]['size']}</span></div>")
             html.append(f"<div class='grid'>")
+            
             for item in group[0]['websites']:
                 url = item['url']
                 safe_name = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "_").replace("?", "_")
